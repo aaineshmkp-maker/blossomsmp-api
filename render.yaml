@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: blossomsmp-api
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: PLUGIN_SECRET
+        value: BlossomSMP$xK7#mQ3
+      - key: ADMIN_KEY
+        value: "801084"
+      - key: MYSQLHOST
+        sync: false
+      - key: MYSQLUSER
+        sync: false
+      - key: MYSQLPASSWORD
+        sync: false
+      - key: MYSQLDATABASE
+        sync: false
+      - key: MYSQLPORT
+        value: "3306"
