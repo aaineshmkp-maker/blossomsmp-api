@@ -276,6 +276,27 @@ async function handleRequest(req, res) {
         return respond({ purchases: rows, count: rows.length });
       }
 
+      case 'save_purchase': {
+        const token = body.token || '';
+        if (!token) return respond({ error: 'token required' }, 400);
+        const [[user]] = await pool.query(`SELECT id,username FROM users WHERE token=? LIMIT 1`, [token]);
+        if (!user) return respond({ error: 'Invalid token' }, 401);
+        const itemName = esc(body.item_name || 'Unknown Item');
+        const itemType = esc(body.item_type || 'Item');
+        const price = parseFloat(body.price || 0);
+        const giftRecipient = body.gift_recipient ? esc(body.gift_recipient) : null;
+        const giftMessage = body.gift_message ? esc(body.gift_message) : null;
+        await pool.query(
+          `INSERT INTO purchases (user_id, item_name, item_type, price, status, gift_recipient, gift_message) VALUES (?,?,?,?,?,?,?)`,
+          [user.id, itemName, itemType, price, 'pending', giftRecipient, giftMessage]
+        );
+        await pool.query(
+          `INSERT INTO server_events (event_type, username, data) VALUES ('purchase', ?, ?)`,
+          [user.username, JSON.stringify({ message: itemName, gift_to: giftRecipient })]
+        );
+        return respond({ success: true });
+      }
+
       case 'mark_delivered': {
         const key = url.searchParams.get('key') || body.key || '';
         if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
