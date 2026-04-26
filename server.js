@@ -88,6 +88,16 @@ async function getDb() {
     player_list TEXT,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
   )`);
+  await db.query(`CREATE TABLE IF NOT EXISTS site_settings (
+    id INT PRIMARY KEY DEFAULT 1,
+    server_name VARCHAR(128) DEFAULT 'Blossom SMP',
+    server_ip VARCHAR(128) DEFAULT '',
+    discord_url VARCHAR(255) DEFAULT '',
+    store_url VARCHAR(255) DEFAULT '',
+    announcement TEXT DEFAULT '',
+    maintenance TINYINT DEFAULT 0,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )\`);
   await db.query(`CREATE TABLE IF NOT EXISTS votes (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(64),
@@ -274,6 +284,66 @@ async function handleRequest(req, res) {
         const status = esc(url.searchParams.get('status') || 'completed');
         const [rows] = await pool.query(`SELECT p.*,u.edition FROM purchases p LEFT JOIN users u ON u.id=p.user_id WHERE p.status=? ORDER BY p.created_at DESC LIMIT 200`, [status]);
         return respond({ purchases: rows, count: rows.length });
+      }
+
+      case 'temp_login': {
+        // Admin-issued temporary login code for testing without plugin
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const username = esc(body.username || 'TestPlayer');
+        const edition = 'java';
+        await pool.query(`INSERT INTO users (username,edition,coins) VALUES (?,?,?) ON DUPLICATE KEY UPDATE updated_at=NOW()`, [username, edition, 100]);
+        const [urows] = await pool.query(`SELECT * FROM users WHERE username=? LIMIT 1`, [username]);
+        const user = urows[0];
+        const token = randomToken();
+        await pool.query(`INSERT INTO sessions (user_id,token) VALUES (?,?)`, [user.id, token]);
+        // Also issue a web code
+        let code;
+        do { code = randomCode(); } while ((await pool.query(`SELECT id FROM web_codes WHERE code=? LIMIT 1`, [code]))[0].length > 0);
+        await pool.query(`DELETE FROM web_codes WHERE username=?`, [username]);
+        await pool.query(`INSERT INTO web_codes (username,code,edition) VALUES (?,?,?)`, [username, code, edition]);
+        return respond({ success: true, code, token, username, message: 'Use this code on the website login, or use the token directly.' });
+      }
+
+      case 'get_settings': {
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const [rows] = await pool.query(`SELECT * FROM site_settings LIMIT 1`).catch(() => [[{}]]);
+        return respond({ settings: rows[0] || {} });
+      }
+
+      case 'save_settings': {
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const { server_ip, server_name, discord_url, store_url, announcement, maintenance } = body;
+        await pool.query(`INSERT INTO site_settings (id,server_ip,server_name,discord_url,store_url,announcement,maintenance) VALUES (1,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE server_ip=?,server_name=?,discord_url=?,store_url=?,announcement=?,maintenance=?,updated_at=NOW()`,
+          [esc(server_ip||''), esc(server_name||'Blossom SMP'), esc(discord_url||''), esc(store_url||''), esc(announcement||''), maintenance?1:0,
+           esc(server_ip||''), esc(server_name||'Blossom SMP'), esc(discord_url||''), esc(store_url||''), esc(announcement||''), maintenance?1:0]);
+        return respond({ success: true });
+      }
+
+      case 'get_users': {
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const [rows] = await pool.query(`SELECT id,username,edition,coins,bank,created_at FROM users ORDER BY created_at DESC LIMIT 100`);
+        return respond({ users: rows });
+      }
+
+      case 'edit_user': {
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const uid = parseInt(body.user_id || 0);
+        const coins = parseInt(body.coins ?? 0);
+        const bank = parseFloat(body.bank ?? 0);
+        if (!uid) return respond({ error: 'user_id required' }, 400);
+        await pool.query(`UPDATE users SET coins=?,bank=? WHERE id=?`, [coins, bank, uid]);
+        return respond({ success: true });
+      }
+
+      case 'get_site_status': {
+        const [rows] = await pool.query(`SELECT * FROM site_settings WHERE id=1 LIMIT 1`).catch(() => [[null]]);
+        const settings = rows[0] || { server_name: 'Blossom SMP', server_ip: '', maintenance: 0, announcement: '' };
+        return respond({ settings });
       }
 
       case 'save_purchase': {
