@@ -265,7 +265,7 @@ async function handleRequest(req, res) {
       }
 
       case 'live_feed': {
-        const [events] = await pool.query(`SELECT event_type,username,data,created_at FROM server_events ORDER BY created_at DESC LIMIT 20`);
+        const [events] = await pool.query(`SELECT id,event_type,username,data,created_at FROM server_events ORDER BY created_at DESC LIMIT 50`);
         const [statsRows] = await pool.query(`SELECT online,max_players,tps,player_list,updated_at FROM server_stats WHERE id=1 LIMIT 1`);
         const stats = statsRows[0] || { online: 0, max_players: 200, tps: 20, player_list: '[]', updated_at: null };
         stats.player_list = JSON.parse(stats.player_list || '[]');
@@ -281,7 +281,7 @@ async function handleRequest(req, res) {
       case 'get_purchases': {
         const key = url.searchParams.get('key') || body.key || '';
         if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const status = esc(url.searchParams.get('status') || 'completed');
+        const status = esc(url.searchParams.get('status') || body.status || 'pending');
         const [rows] = await pool.query(`SELECT p.*,u.edition FROM purchases p LEFT JOIN users u ON u.id=p.user_id WHERE p.status=? ORDER BY p.created_at DESC LIMIT 200`, [status]);
         return respond({ purchases: rows, count: rows.length });
       }
@@ -292,7 +292,7 @@ async function handleRequest(req, res) {
         if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
         const username = esc(body.username || 'TestPlayer');
         const edition = 'java';
-        await pool.query(`INSERT INTO users (username,edition,coins) VALUES (?,?,?) ON DUPLICATE KEY UPDATE updated_at=NOW()`, [username, edition, 100]);
+        const tCoins = parseInt(body.coins || 100); await pool.query(`INSERT INTO users (username,edition,coins) VALUES (?,?,?) ON DUPLICATE KEY UPDATE coins=?,updated_at=NOW()`, [username, edition, tCoins, tCoins]);
         const [urows] = await pool.query(`SELECT * FROM users WHERE username=? LIMIT 1`, [username]);
         const user = urows[0];
         const token = randomToken();
@@ -346,10 +346,22 @@ async function handleRequest(req, res) {
         return respond({ settings });
       }
 
+      case 'delete_feed': {
+        const key = body.key || url.searchParams.get('key') || '';
+        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        const feedId = parseInt(body.id || 0);
+        if (feedId) {
+          await pool.query(`DELETE FROM server_events WHERE id=?`, [feedId]);
+        } else {
+          await pool.query(`DELETE FROM server_events`);
+        }
+        return respond({ success: true });
+      }
+
       case 'save_purchase': {
         const token = body.token || '';
         if (!token) return respond({ error: 'token required' }, 400);
-        const [[user]] = await pool.query(`SELECT id,username FROM users WHERE token=? LIMIT 1`, [token]);
+        const user = await getUserByToken(pool, token);
         if (!user) return respond({ error: 'Invalid token' }, 401);
         const itemName = esc(body.item_name || 'Unknown Item');
         const itemType = esc(body.item_type || 'Item');
