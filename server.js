@@ -17,7 +17,6 @@ async function getDb() {
     waitForConnections: true,
     connectionLimit: 10,
   });
-  // Auto-create tables
   await db.query(`CREATE TABLE IF NOT EXISTS users (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(64) NOT NULL UNIQUE,
@@ -97,7 +96,7 @@ async function getDb() {
     announcement TEXT DEFAULT '',
     maintenance TINYINT DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-  )\`);
+  )`);
   await db.query(`CREATE TABLE IF NOT EXISTS votes (
     id INT AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(64),
@@ -105,28 +104,41 @@ async function getDb() {
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     INDEX(username)
   )`);
-  console.log('[BlossomSMP] DB connected and tables ready.');
+  await db.query(`CREATE TABLE IF NOT EXISTS events (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    title VARCHAR(255) NOT NULL,
+    description TEXT,
+    prize VARCHAR(255),
+    winner VARCHAR(128),
+    status ENUM('upcoming','active','ended') DEFAULT 'upcoming',
+    event_date VARCHAR(64),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  )`);
+  console.log('[BlossomSMP] DB ready.');
   return db;
 }
 
 function randomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let code = '';
-  for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-  return code;
+  let c = '';
+  for (let i = 0; i < 6; i++) c += chars[Math.floor(Math.random() * chars.length)];
+  return c;
 }
-function randomToken() {
-  return require('crypto').randomBytes(32).toString('hex');
-}
-function esc(s) { return String(s || '').replace(/[<>"']/g, '').trim().substring(0, 128); }
+function randomToken() { return require('crypto').randomBytes(32).toString('hex'); }
+function esc(s) { return String(s || '').replace(/[<>\"']/g, '').trim().substring(0, 512); }
+function isAdmin(body, url) { return (body.key || url.searchParams.get('key') || '') === ADMIN_KEY; }
+function isPlugin(body) { return (body.secret || '') === PLUGIN_SECRET; }
 
-async function getUserByToken(db, token) {
+async function getUserByToken(pool, token) {
   if (!token) return null;
-  const [rows] = await db.query(
-    `SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires_at>NOW() LIMIT 1`,
-    [token]
-  );
-  return rows[0] || null;
+  try {
+    const [rows] = await pool.query(
+      `SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id WHERE s.token=? AND s.expires_at>NOW() LIMIT 1`,
+      [token]
+    );
+    return rows[0] || null;
+  } catch(e) { return null; }
 }
 
 async function handleRequest(req, res) {
@@ -136,11 +148,9 @@ async function handleRequest(req, res) {
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
-  // Parse URL + query
   const url = new URL(req.url, `http://localhost`);
   const action = url.searchParams.get('action') || '';
 
-  // Parse body
   let body = {};
   if (req.method === 'POST') {
     const raw = await new Promise(resolve => {
@@ -151,23 +161,19 @@ async function handleRequest(req, res) {
     try { body = JSON.parse(raw); } catch {}
   }
 
-  const respond = (data, code = 200) => {
-    res.writeHead(code);
-    res.end(JSON.stringify(data));
-  };
+  const respond = (data, code = 200) => { res.writeHead(code); res.end(JSON.stringify(data)); };
 
   let pool;
-  try { pool = await getDb(); } catch (e) {
-    return respond({ error: 'DB connection failed: ' + e.message }, 500);
-  }
+  try { pool = await getDb(); } catch (e) { return respond({ error: 'DB error: ' + e.message }, 500); }
 
   try {
     switch (action) {
 
+      // ── PLUGIN ACTIONS ─────────────────────────────────────
       case 'issue_code': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
+        if (!isPlugin(body)) return respond({ error: 'Forbidden' }, 403);
         const username = esc(body.username);
-        const edition  = body.edition === 'bedrock' ? 'bedrock' : 'java';
+        const edition = body.edition === 'bedrock' ? 'bedrock' : 'java';
         if (!username) return respond({ error: 'Username required' }, 400);
         await pool.query(`DELETE FROM web_codes WHERE username=?`, [username]);
         let code;
@@ -176,6 +182,44 @@ async function handleRequest(req, res) {
         return respond({ success: true, code, expires_in: '10 minutes' });
       }
 
+      case 'player_join': {
+        if (!isPlugin(body)) return respond({ error: 'Forbidden' }, 403);
+        const username = esc(body.username);
+        const edition = body.edition === 'bedrock' ? 'bedrock' : 'java';
+        if (!username) return respond({ error: 'Username required' }, 400);
+        await pool.query(`INSERT INTO users (username,edition) VALUES (?,?) ON DUPLICATE KEY UPDATE updated_at=NOW()`, [username, edition]);
+        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES ('join',?,?)`, [username, JSON.stringify({ edition })]);
+        return respond({ success: true });
+      }
+
+      case 'player_quit': {
+        if (!isPlugin(body)) return respond({ error: 'Forbidden' }, 403);
+        const username = esc(body.username);
+        await pool.query(`INSERT INTO server_events (event_type,username) VALUES ('quit',?)`, [username]);
+        return respond({ success: true });
+      }
+
+      case 'server_stats': {
+        if (!isPlugin(body)) return respond({ error: 'Forbidden' }, 403);
+        const online  = parseInt(body.online  || 0);
+        const max     = parseInt(body.max     || 200);
+        const tps     = parseFloat(body.tps   || 20.0);
+        const players = JSON.stringify(body.players || []);
+        await pool.query(`INSERT INTO server_stats (id,online,max_players,tps,player_list) VALUES (1,?,?,?,?) ON DUPLICATE KEY UPDATE online=?,max_players=?,tps=?,player_list=?,updated_at=NOW()`,
+          [online, max, tps, players, online, max, tps, players]);
+        return respond({ success: true });
+      }
+
+      case 'log_vote': {
+        if (!isPlugin(body)) return respond({ error: 'Forbidden' }, 403);
+        const username = esc(body.username);
+        const site = esc(body.site || 'unknown');
+        await pool.query(`INSERT INTO votes (username,site) VALUES (?,?)`, [username, site]);
+        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES ('vote',?,?)`, [username, JSON.stringify({ site })]);
+        return respond({ success: true });
+      }
+
+      // ── PUBLIC ACTIONS ─────────────────────────────────────
       case 'login_with_code': {
         const code = String(body.code || '').toUpperCase().replace(/[^A-Z0-9]/g, '').substring(0, 6);
         if (code.length !== 6) return respond({ error: 'Code must be 6 characters' }, 400);
@@ -218,146 +262,6 @@ async function handleRequest(req, res) {
         return respond({ success: true });
       }
 
-      case 'player_join': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
-        const username = esc(body.username);
-        const edition  = body.edition === 'bedrock' ? 'bedrock' : 'java';
-        if (!username) return respond({ error: 'Username required' }, 400);
-        await pool.query(`INSERT INTO users (username,edition) VALUES (?,?) ON DUPLICATE KEY UPDATE updated_at=NOW()`, [username, edition]);
-        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES ('join',?,?)`, [username, JSON.stringify({ edition })]);
-        return respond({ success: true });
-      }
-
-      case 'player_quit': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
-        const username = esc(body.username);
-        await pool.query(`INSERT INTO server_events (event_type,username) VALUES ('quit',?)`, [username]);
-        return respond({ success: true });
-      }
-
-      case 'server_stats': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
-        const online  = parseInt(body.online  || 0);
-        const max     = parseInt(body.max     || 200);
-        const tps     = parseFloat(body.tps   || 20.0);
-        const players = JSON.stringify(body.players || []);
-        await pool.query(`INSERT INTO server_stats (id,online,max_players,tps,player_list) VALUES (1,?,?,?,?) ON DUPLICATE KEY UPDATE online=?,max_players=?,tps=?,player_list=?,updated_at=NOW()`,
-          [online, max, tps, players, online, max, tps, players]);
-        return respond({ success: true });
-      }
-
-      case 'log_vote': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
-        const username = esc(body.username);
-        const site     = esc(body.site || 'unknown');
-        await pool.query(`INSERT INTO votes (username,site) VALUES (?,?)`, [username, site]);
-        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES ('vote',?,?)`, [username, JSON.stringify({ site })]);
-        return respond({ success: true });
-      }
-
-      case 'announcement': {
-        if ((body.secret || '') !== PLUGIN_SECRET) return respond({ error: 'Forbidden' }, 403);
-        const username = esc(body.username);
-        const type     = esc(body.type    || 'info');
-        const message  = esc(body.message || '');
-        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES (?,?,?)`, [type, username, JSON.stringify({ message })]);
-        return respond({ success: true });
-      }
-
-      case 'live_feed': {
-        const [events] = await pool.query(`SELECT id,event_type,username,data,created_at FROM server_events ORDER BY created_at DESC LIMIT 50`);
-        const [statsRows] = await pool.query(`SELECT online,max_players,tps,player_list,updated_at FROM server_stats WHERE id=1 LIMIT 1`);
-        const stats = statsRows[0] || { online: 0, max_players: 200, tps: 20, player_list: '[]', updated_at: null };
-        stats.player_list = JSON.parse(stats.player_list || '[]');
-        return respond({ events, stats });
-      }
-
-      case 'server_status': {
-        const [rows] = await pool.query(`SELECT online,max_players,tps,player_list,updated_at FROM server_stats WHERE id=1 LIMIT 1`);
-        if (rows.length) { rows[0].player_list = JSON.parse(rows[0].player_list || '[]'); return respond(rows[0]); }
-        return respond({ online: 0, max_players: 200, tps: 20.0, player_list: [] });
-      }
-
-      case 'get_purchases': {
-        const key = url.searchParams.get('key') || body.key || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const status = esc(url.searchParams.get('status') || body.status || 'pending');
-        const [rows] = await pool.query(`SELECT p.*,u.edition FROM purchases p LEFT JOIN users u ON u.id=p.user_id WHERE p.status=? ORDER BY p.created_at DESC LIMIT 200`, [status]);
-        return respond({ purchases: rows, count: rows.length });
-      }
-
-      case 'temp_login': {
-        // Admin-issued temporary login code for testing without plugin
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const username = esc(body.username || 'TestPlayer');
-        const edition = 'java';
-        const tCoins = parseInt(body.coins || 100); await pool.query(`INSERT INTO users (username,edition,coins) VALUES (?,?,?) ON DUPLICATE KEY UPDATE coins=?,updated_at=NOW()`, [username, edition, tCoins, tCoins]);
-        const [urows] = await pool.query(`SELECT * FROM users WHERE username=? LIMIT 1`, [username]);
-        const user = urows[0];
-        const token = randomToken();
-        await pool.query(`INSERT INTO sessions (user_id,token) VALUES (?,?)`, [user.id, token]);
-        // Also issue a web code
-        let code;
-        do { code = randomCode(); } while ((await pool.query(`SELECT id FROM web_codes WHERE code=? LIMIT 1`, [code]))[0].length > 0);
-        await pool.query(`DELETE FROM web_codes WHERE username=?`, [username]);
-        await pool.query(`INSERT INTO web_codes (username,code,edition) VALUES (?,?,?)`, [username, code, edition]);
-        return respond({ success: true, code, token, username, message: 'Use this code on the website login, or use the token directly.' });
-      }
-
-      case 'get_settings': {
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const [rows] = await pool.query(`SELECT * FROM site_settings LIMIT 1`).catch(() => [[{}]]);
-        return respond({ settings: rows[0] || {} });
-      }
-
-      case 'save_settings': {
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const { server_ip, server_name, discord_url, store_url, announcement, maintenance } = body;
-        await pool.query(`INSERT INTO site_settings (id,server_ip,server_name,discord_url,store_url,announcement,maintenance) VALUES (1,?,?,?,?,?,?) ON DUPLICATE KEY UPDATE server_ip=?,server_name=?,discord_url=?,store_url=?,announcement=?,maintenance=?,updated_at=NOW()`,
-          [esc(server_ip||''), esc(server_name||'Blossom SMP'), esc(discord_url||''), esc(store_url||''), esc(announcement||''), maintenance?1:0,
-           esc(server_ip||''), esc(server_name||'Blossom SMP'), esc(discord_url||''), esc(store_url||''), esc(announcement||''), maintenance?1:0]);
-        return respond({ success: true });
-      }
-
-      case 'get_users': {
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const [rows] = await pool.query(`SELECT id,username,edition,coins,bank,created_at FROM users ORDER BY created_at DESC LIMIT 100`);
-        return respond({ users: rows });
-      }
-
-      case 'edit_user': {
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const uid = parseInt(body.user_id || 0);
-        const coins = parseInt(body.coins ?? 0);
-        const bank = parseFloat(body.bank ?? 0);
-        if (!uid) return respond({ error: 'user_id required' }, 400);
-        await pool.query(`UPDATE users SET coins=?,bank=? WHERE id=?`, [coins, bank, uid]);
-        return respond({ success: true });
-      }
-
-      case 'get_site_status': {
-        const [rows] = await pool.query(`SELECT * FROM site_settings WHERE id=1 LIMIT 1`).catch(() => [[null]]);
-        const settings = rows[0] || { server_name: 'Blossom SMP', server_ip: '', maintenance: 0, announcement: '' };
-        return respond({ settings });
-      }
-
-      case 'delete_feed': {
-        const key = body.key || url.searchParams.get('key') || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
-        const feedId = parseInt(body.id || 0);
-        if (feedId) {
-          await pool.query(`DELETE FROM server_events WHERE id=?`, [feedId]);
-        } else {
-          await pool.query(`DELETE FROM server_events`);
-        }
-        return respond({ success: true });
-      }
-
       case 'save_purchase': {
         const token = body.token || '';
         if (!token) return respond({ error: 'token required' }, 400);
@@ -369,27 +273,152 @@ async function handleRequest(req, res) {
         const giftRecipient = body.gift_recipient ? esc(body.gift_recipient) : null;
         const giftMessage = body.gift_message ? esc(body.gift_message) : null;
         await pool.query(
-          `INSERT INTO purchases (user_id, item_name, item_type, price, status, gift_recipient, gift_message) VALUES (?,?,?,?,?,?,?)`,
-          [user.id, itemName, itemType, price, 'pending', giftRecipient, giftMessage]
+          `INSERT INTO purchases (user_id, minecraft_name, item_name, item_type, price, status, gift_recipient, gift_message) VALUES (?,?,?,?,?,?,?,?)`,
+          [user.id, user.username, itemName, itemType, price, 'pending', giftRecipient, giftMessage]
         );
         await pool.query(
-          `INSERT INTO server_events (event_type, username, data) VALUES ('purchase', ?, ?)`,
+          `INSERT INTO server_events (event_type,username,data) VALUES ('purchase',?,?)`,
           [user.username, JSON.stringify({ message: itemName, gift_to: giftRecipient })]
         );
         return respond({ success: true });
       }
 
+      case 'server_status': {
+        const [rows] = await pool.query(`SELECT online,max_players,tps,player_list,updated_at FROM server_stats WHERE id=1 LIMIT 1`);
+        if (rows.length) { rows[0].player_list = JSON.parse(rows[0].player_list || '[]'); return respond(rows[0]); }
+        return respond({ online: 0, max_players: 200, tps: 20.0, player_list: [] });
+      }
+
+      case 'live_feed': {
+        const [events] = await pool.query(`SELECT id,event_type,username,data,created_at FROM server_events ORDER BY created_at DESC LIMIT 50`);
+        const [statsRows] = await pool.query(`SELECT online,max_players,tps,player_list FROM server_stats WHERE id=1 LIMIT 1`);
+        const stats = statsRows[0] || { online: 0, max_players: 200, tps: 20, player_list: '[]' };
+        stats.player_list = JSON.parse(stats.player_list || '[]');
+        return respond({ events, stats });
+      }
+
+      case 'get_events': {
+        const [rows] = await pool.query(`SELECT * FROM events ORDER BY created_at DESC`);
+        return respond({ events: rows });
+      }
+
+      // ── ADMIN ACTIONS ──────────────────────────────────────
+      case 'get_purchases': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const status = esc(url.searchParams.get('status') || body.status || 'pending');
+        const [rows] = await pool.query(`SELECT p.*,u.username AS minecraft_name,u.edition FROM purchases p LEFT JOIN users u ON u.id=p.user_id WHERE p.status=? ORDER BY p.created_at DESC LIMIT 200`, [status]);
+        return respond({ purchases: rows, count: rows.length });
+      }
+
       case 'mark_delivered': {
-        const key = url.searchParams.get('key') || body.key || '';
-        if (key !== ADMIN_KEY) return respond({ error: 'Unauthorized' }, 401);
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
         const pid = parseInt(body.purchase_id || 0);
         if (!pid) return respond({ error: 'purchase_id required' }, 400);
         await pool.query(`UPDATE purchases SET status='delivered',delivered_at=NOW() WHERE id=?`, [pid]);
         return respond({ success: true });
       }
 
+      case 'get_settings': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const [rows] = await pool.query(`SELECT * FROM site_settings WHERE id=1 LIMIT 1`);
+        return respond({ settings: rows[0] || {} });
+      }
+
+      case 'save_settings': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const { server_ip, server_name, discord_url, store_url, announcement, maintenance } = body;
+        await pool.query(
+          `INSERT INTO site_settings (id,server_ip,server_name,discord_url,store_url,announcement,maintenance) VALUES (1,?,?,?,?,?,?)
+           ON DUPLICATE KEY UPDATE server_ip=VALUES(server_ip),server_name=VALUES(server_name),discord_url=VALUES(discord_url),store_url=VALUES(store_url),announcement=VALUES(announcement),maintenance=VALUES(maintenance),updated_at=NOW()`,
+          [esc(server_ip||''), esc(server_name||'Blossom SMP'), esc(discord_url||''), esc(store_url||''), esc(announcement||''), maintenance?1:0]
+        );
+        return respond({ success: true });
+      }
+
+      case 'get_site_status': {
+        const [rows] = await pool.query(`SELECT * FROM site_settings WHERE id=1 LIMIT 1`);
+        return respond({ settings: rows[0] || { server_name: 'Blossom SMP', server_ip: '', maintenance: 0, announcement: '' } });
+      }
+
+      case 'get_users': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const [rows] = await pool.query(`SELECT id,username,edition,coins,bank,created_at FROM users ORDER BY created_at DESC LIMIT 100`);
+        return respond({ users: rows });
+      }
+
+      case 'edit_user': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const uid = parseInt(body.user_id || 0);
+        if (!uid) return respond({ error: 'user_id required' }, 400);
+        await pool.query(`UPDATE users SET coins=?,bank=? WHERE id=?`, [parseInt(body.coins||0), parseFloat(body.bank||0), uid]);
+        return respond({ success: true });
+      }
+
+      case 'delete_feed': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const feedId = parseInt(body.id || 0);
+        if (feedId) await pool.query(`DELETE FROM server_events WHERE id=?`, [feedId]);
+        else await pool.query(`DELETE FROM server_events`);
+        return respond({ success: true });
+      }
+
+      case 'temp_login': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const username = esc(body.username || 'TestPlayer');
+        const tCoins = parseInt(body.coins || 500);
+        await pool.query(`INSERT INTO users (username,edition,coins) VALUES (?,?,?) ON DUPLICATE KEY UPDATE coins=?,updated_at=NOW()`, [username, 'java', tCoins, tCoins]);
+        const [urows] = await pool.query(`SELECT * FROM users WHERE username=? LIMIT 1`, [username]);
+        const user = urows[0];
+        const token = randomToken();
+        await pool.query(`INSERT INTO sessions (user_id,token) VALUES (?,?)`, [user.id, token]);
+        await pool.query(`DELETE FROM web_codes WHERE username=?`, [username]);
+        let code;
+        do { code = randomCode(); } while ((await pool.query(`SELECT id FROM web_codes WHERE code=? LIMIT 1`, [code]))[0].length > 0);
+        await pool.query(`INSERT INTO web_codes (username,code,edition) VALUES (?,?,'java')`, [username, code]);
+        return respond({ success: true, code, token, username });
+      }
+
+      case 'announcement': {
+        // Accept both admin key and plugin secret
+        if (!isAdmin(body, url) && !isPlugin(body)) return respond({ error: 'Unauthorized' }, 401);
+        const username = esc(body.username || 'Admin');
+        const type = esc(body.type || 'info');
+        const message = esc(body.message || '');
+        if (!message) return respond({ error: 'message required' }, 400);
+        await pool.query(`INSERT INTO server_events (event_type,username,data) VALUES (?,?,?)`, [type, username, JSON.stringify({ message })]);
+        return respond({ success: true });
+      }
+
+      case 'save_event': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const id = parseInt(body.id || 0);
+        const title = esc(body.title || '');
+        if (!title) return respond({ error: 'title required' }, 400);
+        const description = esc(body.description || '');
+        const prize = esc(body.prize || '');
+        const winner = esc(body.winner || '');
+        const status = ['upcoming','active','ended'].includes(body.status) ? body.status : 'upcoming';
+        const event_date = esc(body.event_date || '');
+        if (id) {
+          await pool.query(`UPDATE events SET title=?,description=?,prize=?,winner=?,status=?,event_date=?,updated_at=NOW() WHERE id=?`,
+            [title, description, prize, winner, status, event_date, id]);
+        } else {
+          await pool.query(`INSERT INTO events (title,description,prize,winner,status,event_date) VALUES (?,?,?,?,?,?)`,
+            [title, description, prize, winner, status, event_date]);
+        }
+        return respond({ success: true });
+      }
+
+      case 'delete_event': {
+        if (!isAdmin(body, url)) return respond({ error: 'Unauthorized' }, 401);
+        const id = parseInt(body.id || 0);
+        if (!id) return respond({ error: 'id required' }, 400);
+        await pool.query(`DELETE FROM events WHERE id=?`, [id]);
+        return respond({ success: true });
+      }
+
       default:
-        return respond({ error: 'Unknown action' }, 400);
+        return respond({ error: 'Unknown action: ' + action }, 400);
     }
   } catch (e) {
     console.error('[BlossomSMP] Error:', e.message);
